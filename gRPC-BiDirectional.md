@@ -920,3 +920,522 @@ import java.util.Optional;
 
 @Repository
 public interface ClientOrderRepository extends JpaRepository<ClientOrder, Long> {
+    Optional<ClientOrder> findByOrderNumber(String orderNumber);
+    boolean existsByOrderNumber(String orderNumber);
+}
+```
+
+### `order-client/src/main/java/com/example/orderclient/service/OrderEventClientService.java`
+
+```java
+package com.example.orderclient.service;
+
+import com.example.grpc.*;
+import com.example.orderclient.service.OrderDataFetcherService;
+import io.grpc.stub.StreamObserver;
+import net.devh.boot.grpc.client.inject.GrpcClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import java.util.Arrays;
+
+@Service
+public class OrderEventClientService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OrderEventClientService.class);
+
+    @GrpcClient("order-server")
+    private OrderEventServiceGrpc.OrderEventServiceStub orderEventStub;
+
+    @Autowired
+    private OrderDataFetcherService orderDataFetcherService;
+
+    @Value("${client.id:client-001}")
+    private String clientId;
+
+    @PostConstruct
+    public void init() {
+        subscribeToOrderEvents();
+    }
+
+    public void subscribeToOrderEvents() {
+        logger.info("Starting order event subscription for client: {}", clientId);
+        
+        OrderEventSubscriptionRequest request = OrderEventSubscriptionRequest.newBuilder()
+                .setClientId(clientId)
+                .addAllEventTypes(Arrays.asList("ORDER_CREATED", "ORDER_READY_FOR_PROCESSING", "ORDER_UPDATED"))
+                .build();
+
+        StreamObserver<OrderEvent> responseObserver = new StreamObserver<OrderEvent>() {
+            @Override
+            public void onNext(OrderEvent orderEvent) {
+                logger.info("Received order event: {} for order: {} with priority: {}", 
+                           orderEvent.getEventType(), orderEvent.getOrderNumber(), orderEvent.getPriority());
+                
+                // Process the order event asynchronously
+                handleOrderEvent(orderEvent);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                logger.error("Error in order event subscription: {}", throwable.getMessage());
+                // Implement reconnection logic
+                reconnectAfterDelay();
+            }
+
+            @Override
+            public void onCompleted() {
+                logger.info("Order event subscription completed");
+            }
+        };
+
+        orderEventStub.subscribeToOrderEvents(request, responseObserver);
+        logger.info("Order event subscription established");
+    }
+
+    private void handleOrderEvent(OrderEvent orderEvent) {
+        String orderNumber = orderEvent.getOrderNumber();
+        String eventType = orderEvent.getEventType();
+        
+        logger.info("Processing order event: {} for order: {}", eventType, orderNumber);
+        
+        // Trigger async order data fetching and processing
+        orderDataFetcherService.fetchAndProcessOrderData(orderEvent);
+    }
+
+    private void reconnectAfterDelay() {
+        new Thread(() -> {
+            try {
+                logger.info("Attempting to reconnect to order events in 5 seconds...");
+                Thread.sleep(5000);
+                subscribeToOrderEvents();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.error("Reconnection interrupted");
+            }
+        }).start();
+    }
+}
+```
+
+### `order-client/src/main/java/com/example/orderclient/service/OrderDataFetcherService.java`
+
+```java
+package com.example.orderclient.service;
+
+import com.example.grpc.OrderEvent;
+import com.example.orderclient.model.ClientOrder;
+import com.example.orderclient.repository.ClientOrderRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.*;
+
+@Service
+public class OrderDataFetcherService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OrderDataFetcherService.class);
+
+    @Autowired
+    private ClientOrderRepository clientOrderRepository;
+
+    @Autowired
+    private OrderStatusClientService orderStatusClientService;
+
+    @Value("${client.id:client-001}")
+    private String clientId;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final Random random = new Random();
+
+    @Async
+    public void fetchAndProcessOrderData(OrderEvent orderEvent) {
+        try {
+            String orderNumber = orderEvent.getOrderNumber();
+            
+            logger.info("Fetching order data internally for order: {}", orderNumber);
+            
+            // Simulate fetching order data from internal systems (database, external API, etc.)
+            ClientOrder orderData = fetchOrderDataInternally(orderNumber);
+            
+            if (orderData != null) {
+                // Send the fetched order data back to the server
+                orderStatusClientService.sendOrderDataToServer(orderEvent, orderData);
+                
+                // Also demonstrate requesting status from server
+                if (random.nextBoolean()) {
+                    // Randomly request order status from server
+                    orderStatusClientService.requestOrderStatusFromServer(orderNumber);
+                }
+            } else {
+                logger.warn("Could not fetch order data for order: {}", orderNumber);
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error processing order event: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Simulate fetching order data from internal client systems
+     * In real-world scenario, this would query client's database, call external APIs, etc.
+     */
+    private ClientOrder fetchOrderDataInternally(String orderNumber) {
+        try {
+            // Check if order already exists in client database
+            Optional<ClientOrder> existingOrder = clientOrderRepository.findByOrderNumber(orderNumber);
+            
+            if (existingOrder.isPresent()) {
+                logger.info("Found existing order in client database: {}", orderNumber);
+                return existingOrder.get();
+            }
+            
+            // Simulate fetching from external systems
+            logger.info("Simulating external data fetch for order: {}", orderNumber);
+            Thread.sleep(1000 + random.nextInt(2000)); // Simulate network delay
+            
+            // Create sample order data (in real scenario, this would come from actual systems)
+            ClientOrder order = createSampleOrderData(orderNumber);
+            
+            // Save to client database
+            clientOrderRepository.save(order);
+            
+            logger.info("Order data fetched and stored locally: {}", orderNumber);
+            return order;
+            
+        } catch (Exception e) {
+            logger.error("Error fetching order data for {}: {}", orderNumber, e.getMessage());
+            return null;
+        }
+    }
+
+    private ClientOrder createSampleOrderData(String orderNumber) {
+        ClientOrder order = new ClientOrder(
+            orderNumber,
+            "CUST-" + random.nextInt(1000),
+            100.0 + (random.nextDouble() * 900.0)
+        );
+        
+        order.setCustomerName("Customer " + random.nextInt(1000));
+        order.setCustomerEmail("customer" + random.nextInt(1000) + "@example.com");
+        order.setShippingAddress("123 Client St, Client City, State " + random.nextInt(99999));
+        order.setStatus("FETCHED_BY_CLIENT");
+        
+        // Create sample items JSON
+        List<Map<String, Object>> items = new ArrayList<>();
+        int itemCount = 1 + random.nextInt(3);
+        
+        for (int i = 0; i < itemCount; i++) {
+            Map<String, Object> item = new HashMap<>();
+            item.put("item_id", "ITEM-" + random.nextInt(1000));
+            item.put("item_name", "Product " + (i + 1));
+            item.put("quantity", 1 + random.nextInt(5));
+            item.put("price", 10.0 + (random.nextDouble() * 90.0));
+            items.add(item);
+        }
+        
+        try {
+            order.setItemsJson(objectMapper.writeValueAsString(items));
+        } catch (Exception e) {
+            logger.error("Error serializing items to JSON: {}", e.getMessage());
+            order.setItemsJson("[]");
+        }
+        
+        order.setProcessedDate(LocalDateTime.now());
+        
+        return order;
+    }
+}
+```
+
+### `order-client/src/main/java/com/example/orderclient/service/OrderStatusClientService.java`
+
+```java
+package com.example.orderclient.service;
+
+import com.example.grpc.*;
+import com.example.orderclient.model.ClientOrder;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.grpc.stub.StreamObserver;
+import net.devh.boot.grpc.client.inject.GrpcClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class OrderStatusClientService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OrderStatusClientService.class);
+
+    @GrpcClient("order-server")
+    private OrderDataServiceGrpc.OrderDataServiceBlockingStub orderDataBlockingStub;
+
+    @GrpcClient("order-server")
+    private OrderDataServiceGrpc.OrderDataServiceStub orderDataAsyncStub;
+
+    @Value("${client.id:client-001}")
+    private String clientId;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /**
+     * Send order data back to server after client fetches it internally
+     */
+    @Async
+    public void sendOrderDataToServer(OrderEvent originalEvent, ClientOrder clientOrder) {
+        try {
+            logger.info("Sending order data back to server for order: {}", clientOrder.getOrderNumber());
+            
+            // Convert ClientOrder to gRPC OrderData
+            OrderData.Builder orderDataBuilder = OrderData.newBuilder()
+                    .setOrderNumber(clientOrder.getOrderNumber())
+                    .setCustomerId(clientOrder.getCustomerId())
+                    .setTotalAmount(clientOrder.getTotalAmount())
+                    .setShippingAddress(clientOrder.getShippingAddress() != null ? clientOrder.getShippingAddress() : "")
+                    .setOrderStatus(clientOrder.getStatus())
+                    .setOrderDate(clientOrder.getOrderDate().toEpochSecond(ZoneOffset.UTC))
+                    .setClientId(clientId)
+                    .setProcessedTimestamp(System.currentTimeMillis());
+
+            // Add order items if available
+            if (clientOrder.getItemsJson() != null && !clientOrder.getItemsJson().isEmpty()) {
+                try {
+                    List<Map<String, Object>> items = objectMapper.readValue(
+                        clientOrder.getItemsJson(), 
+                        objectMapper.getTypeFactory().constructCollectionType(List.class, Map.class)
+                    );
+                    
+                    for (Map<String, Object> itemMap : items) {
+                        OrderItem orderItem = OrderItem.newBuilder()
+                                .setItemId(itemMap.get("item_id").toString())
+                                .setItemName(itemMap.get("item_name").toString())
+                                .setQuantity(((Number) itemMap.get("quantity")).intValue())
+                                .setPrice(((Number) itemMap.get("price")).doubleValue())
+                                .build();
+                        orderDataBuilder.addItems(orderItem);
+                    }
+                } catch (Exception e) {
+                    logger.error("Error parsing items JSON: {}", e.getMessage());
+                }
+            }
+
+            // Create submission request
+            OrderDataSubmission submission = OrderDataSubmission.newBuilder()
+                    .setSubmissionId(UUID.randomUUID().toString())
+                    .setOriginalEventId(originalEvent.getEventId())
+                    .setOrderData(orderDataBuilder.build())
+                    .setProcessingNotes("Order data fetched and processed by " + clientId)
+                    .build();
+
+            // Send data to server
+            OrderDataSubmissionResponse response = orderDataBlockingStub
+                    .withDeadlineAfter(10, TimeUnit.SECONDS)
+                    .submitOrderData(submission);
+
+            if (response.getSuccess()) {
+                logger.info("Order data successfully sent to server. Response: {}", response.getMessage());
+                logger.info("Server updated order status to: {}", response.getServerOrderStatus());
+            } else {
+                logger.error("Failed to send order data to server: {}", response.getMessage());
+            }
+
+        } catch (Exception e) {
+            logger.error("Error sending order data to server: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Request order status from server
+     */
+    @Async
+    public void requestOrderStatusFromServer(String orderNumber) {
+        try {
+            logger.info("Requesting order status from server for order: {}", orderNumber);
+            
+            OrderStatusRequest request = OrderStatusRequest.newBuilder()
+                    .setOrderNumber(orderNumber)
+                    .setRequestingClientId(clientId)
+                    .build();
+
+            OrderStatusResponse response = orderDataBlockingStub
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .getOrderStatus(request);
+
+            if (response.getFound()) {
+                logger.info("Order status received from server - Order: {}, Status: {}, Last Updated By: {}", 
+                           response.getOrderNumber(), 
+                           response.getCurrentStatus(), 
+                           response.getLastUpdatedBy());
+                
+                if (!response.getAdditionalInfo().isEmpty()) {
+                    logger.info("Additional info: {}", response.getAdditionalInfo());
+                }
+            } else {
+                logger.warn("Order not found on server: {}", orderNumber);
+            }
+
+        } catch (Exception e) {
+            logger.error("Error requesting order status from server: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Send async status request (using async stub for demonstration)
+     */
+    public void requestOrderStatusAsync(String orderNumber) {
+        logger.info("Sending async order status request for order: {}", orderNumber);
+        
+        OrderStatusRequest request = OrderStatusRequest.newBuilder()
+                .setOrderNumber(orderNumber)
+                .setRequestingClientId(clientId)
+                .build();
+
+        StreamObserver<OrderStatusResponse> responseObserver = new StreamObserver<OrderStatusResponse>() {
+            @Override
+            public void onNext(OrderStatusResponse response) {
+                if (response.getFound()) {
+                    logger.info("Async order status response - Order: {}, Status: {}", 
+                               response.getOrderNumber(), response.getCurrentStatus());
+                } else {
+                    logger.warn("Async response: Order not found - {}", orderNumber);
+                }
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                logger.error("Error in async order status request: {}", throwable.getMessage());
+            }
+
+            @Override
+            public void onCompleted() {
+                logger.debug("Async order status request completed for order: {}", orderNumber);
+            }
+        };
+
+        orderDataAsyncStub.getOrderStatus(request, responseObserver);
+    }
+}
+```
+
+### `order-client/src/main/resources/application.yml`
+
+```yaml
+server:
+  port: 8081
+
+grpc:
+  client:
+    order-server:
+      address: 'static://localhost:9090'
+      negotiation-type: PLAINTEXT
+
+spring:
+  application:
+    name: order-client
+  datasource:
+    url: jdbc:h2:mem:clientorderdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: 
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+client:
+  id: client-001
+
+logging:
+  level:
+    com.example.orderclient: DEBUG
+    net.devh.boot.grpc: DEBUG
+```
+
+## 4. How to Run and Test the System
+
+### Prerequisites
+- Java 17 or higher
+- Gradle 7.x or higher
+
+### Steps to Run
+
+1. **Start the Order Server:**
+   ```bash
+   cd order-server
+   ./gradlew bootRun
+   ```
+   The server will start on port 8080 (HTTP) and 9090 (gRPC).
+
+2. **Start the Order Client:**
+   ```bash
+   cd order-client
+   ./gradlew bootRun
+   ```
+   The client will start on port 8081 and automatically connect to the server.
+
+### What Happens in the System
+
+1. **Server generates order events** every 20 seconds with random order numbers
+2. **Client receives order events** and logs them
+3. **Client fetches order data internally** (simulates database/API calls)
+4. **Client sends the fetched data back to server** via gRPC
+5. **Server processes and stores** the order data in its database
+6. **Client occasionally requests order status** from server
+7. **Server responds with current order status**
+
+### Key Features Demonstrated
+
+1. **Event-Driven Architecture**: Server notifies clients of new orders
+2. **Async Processing**: Client processes events asynchronously
+3. **Bidirectional Communication**: 
+   - Server → Client (events)
+   - Client → Server (order data)
+   - Client ← Server (status responses)
+4. **Internal Data Fetching**: Client simulates fetching data from internal systems
+5. **Database Integration**: Both services store data in H2 databases
+6. **Error Handling**: Comprehensive error handling and logging
+7. **Reconnection**: Automatic reconnection on connection loss
+
+### Testing the System
+
+1. **Monitor Logs**: Watch both services' logs to see the flow
+2. **Database Access**: 
+   - Server: http://localhost:8080/h2-console
+   - Client: http://localhost:8081/h2-console
+3. **Scale Testing**: Run multiple client instances to test multi-client scenarios
+4. **Failure Testing**: Stop/restart services to test reconnection
+
+### Real-World Use Cases
+
+This pattern is perfect for:
+- **Order Processing Systems**: E-commerce order fulfillment
+- **Financial Transactions**: Payment processing workflows  
+- **IoT Systems**: Device status monitoring and data collection
+- **Microservices**: Service-to-service communication
+- **Event Sourcing**: Distributed event processing
+- **Data Pipeline**: ETL operations across systems
+
+The system demonstrates a complete bidirectional gRPC communication pattern where clients react to server events, process data internally, and communicate back with results.
